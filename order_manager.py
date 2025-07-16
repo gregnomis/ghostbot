@@ -5,76 +5,93 @@ import json
 import random
 import time
 import redis
-from config import TRADING_COIN, REDIS_HOST, REDIS_PORT, ORDER_SIZE
+
+from config import (
+    TRADING_COIN,
+    REDIS_HOST,
+    REDIS_PORT,
+    ORDER_SIZE,
+    SPREAD_BUFFER,
+    REBATE_PCT,
+)
 from position_manager import get_net_delta, update_net_delta
+from db import record_fill
+from metrics import rebate_total, delta_exposure, realized_pnl
 
-# In a real build, replace this with signed order submission via API.
-def mock_submit_limit_order(side, price, size):
-    print(f"[MOCK] Submitted {side.upper()} order for {size} @ {price}")
-    return {"order_id": str(random.randint(10000, 99999)), "price": price, "side": side}
-
-def mock_cancel_order(order_id):
-    print(f"[MOCK] Canceled order {order_id}")
-
-# Connect to Redis
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
 
+def mock_submit_limit_order(side, price, size):
+    # simulate a fill immediately for testing
+    fill_sz = size
+    fill_px = price
+
+    # 1) Record the fill in the database (fee is negative rebate)
+    fee = -fill_px * fill_sz * REBATE_PCT
+    record_fill(side, fill_px, fill_sz, fee)
+
+    # 2) Update rebate counter (always positive)
+    rebate_total.inc(fill_px * fill_sz * REBATE_PCT)
+
+    # 3) Compute realized PnL: +px*sz on sell, –px*sz on buy
+    pnl = fill_px * fill_sz * (1 if side == "sell" else -1)
+    if pnl >= 0:
+        realized_pnl.inc(pnl)
+    else:
+        realized_pnl.dec(-pnl)
+
+    print(f"[MOCK FILL] {side.upper()} {fill_sz}@{fill_px}, pnl=${pnl:.2f}")
+    return {"order_id": str(random.randint(10000, 99999))}
+
+def mock_cancel_order(oid):
+    print(f"[MOCK] Canceled order {oid}")
+
 async def market_maker_loop():
+    side = "buy"
     current_order = None
-    order_time = None
-    side = "buy"  # "buy" or "sell" – you can flip it for one-sided quoting
+    order_time = 0
 
     while True:
         try:
-            orderbook_json = r.get(f"{TRADING_COIN}_orderbook")
-            if not orderbook_json:
+            raw = r.get(f"{TRADING_COIN}_orderbook")
+            if not raw:
                 await asyncio.sleep(0.1)
                 continue
 
-            orderbook = json.loads(orderbook_json)
+            ob = json.loads(raw)
+            best_bid = float(ob['bids'][0]['px'])
+            best_ask = float(ob['asks'][0]['px'])
+            price = (best_bid - SPREAD_BUFFER) if side == "buy" else (best_ask + SPREAD_BUFFER)
 
-            # Extract best bid/ask
-            best_bid = float(orderbook['bids'][0]['px'])
-            best_ask = float(orderbook['asks'][0]['px'])
-
-            # Quote mid minus or plus spread
-            spread_buffer = 0.2  # $0.20 offset
-            if side == "buy":
-                price = best_bid - spread_buffer
-            else:
-                price = best_ask + spread_buffer
-
-            # Check delta exposure
+            # Update net delta gauge
             delta = get_net_delta()
+            delta_exposure.set(delta)
+
+            # Risk checks
             if side == "buy" and delta >= ORDER_SIZE:
-                print("🛑 Delta too long, skipping buy")
+                print("🛑 too long → skip buy")
                 await asyncio.sleep(1)
                 continue
-            elif side == "sell" and delta <= -ORDER_SIZE:
-                print("🛑 Delta too short, skipping sell")
+            if side == "sell" and delta <= -ORDER_SIZE:
+                print("🛑 too short → skip sell")
                 await asyncio.sleep(1)
                 continue
 
-            # Cancel previous if it's stale
+            # Cancel stale order
             if current_order and (time.time() - order_time > 5):
                 mock_cancel_order(current_order["order_id"])
                 current_order = None
 
-            # Place new order if none active
+            # Place new order
             if not current_order:
-                order = mock_submit_limit_order(side, price, ORDER_SIZE)
-                current_order = order
+                current_order = mock_submit_limit_order(side, price, ORDER_SIZE)
                 order_time = time.time()
-
-                # Update mock delta
-                if side == "buy":
-                    update_net_delta(ORDER_SIZE)
-                else:
-                    update_net_delta(-ORDER_SIZE)
+                # Adjust our mock position
+                update_net_delta(ORDER_SIZE if side == "buy" else -ORDER_SIZE)
+                # Flip side for alternating buys/sells
+                side = "sell" if side == "buy" else "buy"
 
             await asyncio.sleep(0.5)
 
         except Exception as e:
-            print(f"[ERROR] in order manager: {e}")
+            print(f"[OM ERROR] {e}")
             await asyncio.sleep(1)
-
